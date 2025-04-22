@@ -14,7 +14,7 @@ from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
 from sklearn.model_selection import GridSearchCV, cross_val_score, KFold, StratifiedKFold
 from sklearn.pipeline import Pipeline 
 from sklearn.pipeline import make_pipeline
-from sklearn.metrics import matthews_corrcoef, roc_auc_score, balanced_accuracy_score, f1_score, recall_score, precision_score, precision_recall_curve, auc, confusion_matrix
+from sklearn.metrics import fbeta_score, matthews_corrcoef, roc_auc_score, balanced_accuracy_score, f1_score, recall_score, precision_score, precision_recall_curve, auc, confusion_matrix
 from sklearn.base import clone
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import GaussianNB
@@ -98,15 +98,25 @@ class NestedCrossVal:
         y = df[target]
         return X.values, y.values
 
-    def model_tuning(self, model_key, X_train, y_train, inner_cv, random_state, n_jobs):
+    def model_tuning(self, model_key, X_train, y_train, inner_cv):
         """
         Run inner CV hyperparameter search for one model.
-        Returns best fitted pipeline and params.
+        Uses self.random_state and self.n_jobs internally.
         """
-        inner_split = StratifiedKFold(n_splits=inner_cv, shuffle=True, random_state=random_state)
-        best_rmse, best_pipe, best_params = float('inf'), None, None
-        # Generate combos
-        param_combos = self.generate_param_combinations({model_key: self.param_grid[model_key]})[model_key]
+        inner_split = StratifiedKFold(
+            n_splits=inner_cv,
+            shuffle=True,
+            random_state=self.random_state
+        )
+
+        best_score = -np.inf
+        best_pipe = None
+        best_params = None
+
+        param_combos = self.generate_param_combinations(
+            {model_key: self.param_grid[model_key]}
+        )[model_key]
+
         for combo in param_combos:
             proto = self.models[model_key]
             p = proto.get_params()
@@ -114,16 +124,23 @@ class NestedCrossVal:
             est = proto.__class__(**p)
             pipeline = make_pipeline(StandardScaler(), est)
 
-            aucs = cross_val_score(pipeline, X_train, y_train,
-                                   scoring='roc_auc',
-                                   cv=inner_split,
-                                   n_jobs=self.n_jobs)
-            print(f"[{model_key}] Tested {combo} -> AUC {mean_auc:.4f}")
+            aucs = cross_val_score(
+                pipeline,
+                X_train,
+                y_train,
+                scoring='roc_auc',
+                cv=inner_split,
+                n_jobs=self.n_jobs
+            )
             mean_auc = aucs.mean()
+            print(f"[{model_key}] Tested {combo} -> AUC {mean_auc:.4f}")
+
             if mean_auc > best_score:
                 best_score, best_params = mean_auc, combo
+                best_pipe = pipeline
                 print(f"[{model_key}] New best AUC {mean_auc:.4f}, params {combo}")
 
+        # Return the (unfitted) pipeline and the best params dict:
         return best_pipe, best_params
 
     def inner_loop(self, df, target, model_key, columns_to_remove=None, inner_cv=3):
