@@ -24,36 +24,71 @@ from sklearn.ensemble import RandomForestClassifier
 from lightgbm import LGBMClassifier
 
 class NestedCrossVal:
-    def __init__(self,
-                 models: dict,
-                 param_grid: dict,
-                 R: int = 10,
-                 N: int = 5,
-                 K: int = 3,
-                 random_state: int = 42,
-                 n_jobs: int = 1):
+    def __init__(
+        self,
+        R: int = 10,
+        N: int = 5,
+        K: int = 3,
+        random_state: int = 42,
+        n_jobs: int = 1
+    ):
         """
-        Initialize the repeated nested cross-validation runner.
+        Initialize repeated nested cross-validation with default models.
 
         Parameters
         ----------
-        models : dict
-            Mapping of model names to unfitted estimator instances.
-        param_grid : dict
-            Mapping of model names to their hyperparameter grids.
         R : int
-            Number of repetitions of the nested CV process (outer+inner).
+            Number of repetitions of the full nested CV.
         N : int
-            Number of folds in the outer loop.
+            Number of outer folds.
         K : int
-            Number of folds in the inner loop.
+            Number of inner folds.
         random_state : int
-            Seed for reproducibility in splitting.
+            Seed for reproducibility.
         n_jobs : int
-            Number of parallel jobs to run.
+            Number of parallel jobs for CV.
         """
-        self.models = models
-        self.param_grid = param_grid
+        # Initialize default models
+        self.models = {
+            'LogisticRegression-elasticnet': LogisticRegression(
+                penalty='elasticnet', solver='saga', random_state=random_state, max_iter=10000
+            ),
+            'GaussianNB': GaussianNB(),
+            'LDA': LinearDiscriminantAnalysis(),
+            'SVC': SVC(random_state=random_state, probability=True),
+            'RandomForest': RandomForestClassifier(random_state=random_state),
+            'LightGBM': LGBMClassifier(random_state=random_state)
+        }
+        # Default hyperparameter grids
+        self.param_grid = {
+            'LogisticRegression-elasticnet': {
+                'C': [0.01, 0.1, 1, 10],
+                'l1_ratio': [0.0, 0.25, 0.5, 0.75, 1.0]
+            },
+            'GaussianNB': {
+                'var_smoothing': np.logspace(-9, -1, 9)
+            },
+            'LDA': [
+                {'solver': ['svd']},
+                {'solver': ['lsqr', 'eigen'], 'shrinkage': [None, 'auto']}
+            ],
+            'SVC': [
+                {'kernel': ['linear'], 'C': [0.1, 1, 10]},
+                {'kernel': ['rbf'], 'C': [0.1, 1, 10], 'gamma': ['scale', 'auto', 0.01, 0.1]}
+            ],
+            'RandomForest': {
+                'n_estimators': [100, 200],
+                'max_depth': [None, 10, 20],
+                'min_samples_split': [2, 5],
+                'min_samples_leaf': [1, 2]
+            },
+            'LightGBM': {
+                'n_estimators': [100, 200],
+                'num_leaves': [31, 50, 100],
+                'learning_rate': [0.01, 0.1, 0.2],
+                'max_depth': [-1, 10, 20]
+            }
+        }
         self.R = R
         self.N = N
         self.K = K
@@ -222,48 +257,23 @@ class NestedCrossVal:
         metrics_df = pd.DataFrame(records).set_index('fold')
         return metrics_df, best_params_list
 
-    def run_repeated_nested_cv(self, df, target, columns_to_remove=None):
-        """
-        Execute R repetitions of nested CV across all models.
-
-        Returns
-        -------
-        results : dict
-            For each model:
-              - 'metrics': DataFrame of R×N outer-fold results
-              - 'summary': DataFrame with median, ci_lower, ci_upper per metric
-              - 'best_params': list of best_params per outer fold
-        """
+    def run_repeated_nested_cv(self, df, target, outer_cv, inner_cv, num_rounds, columns_to_remove=None):
         results = {}
         for model_key in self.models:
-            all_metrics = []
-            all_params = []
-            for r in range(self.R):
-                df_metrics, params_list = self.outer_loop(
-                    df, target, model_key,
-                    columns_to_remove=columns_to_remove
-                )
-                df_metrics['repeat'] = r
-                all_metrics.append(df_metrics)
-                all_params.extend(params_list)
-
-            full_df = pd.concat(all_metrics, ignore_index=True)
-            # Calculate medians and 95% CI
-            metrics_only = full_df.drop(columns=['repeat', 'fold'])
-            median = metrics_only.median()
-            ci_lower = metrics_only.quantile(0.025)
-            ci_upper = metrics_only.quantile(0.975)
+            all_df, all_params = [], []
+            for r in range(num_rounds):
+                dfm, plist = self.outer_loop(df, target, model_key, outer_cv, inner_cv, columns_to_remove)
+                dfm['repeat'] = r+1  # 1-based round index
+                all_df.append(dfm); all_params.extend(plist)
+            full = pd.concat(all_df, ignore_index=True)
+            # keep 'repeat' and 'fold'
+            metrics = full.drop(columns=['repeat','fold'])
             summary = pd.DataFrame({
-                'median': median,
-                'ci_lower': ci_lower,
-                'ci_upper': ci_upper
+                'median': metrics.median(),
+                'ci_lower': metrics.quantile(0.025),
+                'ci_upper': metrics.quantile(0.975)
             })
-
-            results[model_key] = {
-                'metrics': full_df,
-                'summary': summary,
-                'best_params': all_params
-            }
+            results[model_key] = {'metrics': full, 'summary': summary, 'best_params': all_params}
         return results
 
 
