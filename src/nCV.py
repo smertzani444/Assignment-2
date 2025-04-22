@@ -70,7 +70,7 @@ class NestedCrossVal:
             }
         }
 
-    def generate_param_combintions(param_grid):
+    def generate_param_combintions(self, param_grid):
         model_combinations = {}
         for model, params in param_grid.items():
         
@@ -87,10 +87,12 @@ class NestedCrossVal:
                 ]
         return model_combinations
     
-    def separate_features_target(df, target, columns_to_remove=None):
+    def separate_features_target(self, df, target, columns_to_remove=None):
         if columns_to_remove is None:
             columns_to_remove=[]
         columns_to_remove=set(columns_to_remove + [target])
         X=df.drop(columns=[col for col in columns_to_remove if col in df.columns])
         y=df[target]
         return X, y
+    
+    def 
