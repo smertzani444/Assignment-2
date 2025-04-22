@@ -109,12 +109,28 @@ class NestedCrossVal:
             random_state=self.random_state
         )
 
+        if model_key == 'LightGBM':
+            # compute imbalance ratio on this fold's training data
+            neg, pos = np.bincount(y_train)
+            ratio = neg / pos
+            # make a shallow copy of the param grid so we don't pollute self.param_grid permanently
+            local_grid = dict(self.param_grid['LightGBM'])
+            local_grid.update({
+                'scale_pos_weight': [ratio, 1.0],
+                'boosting_type':      ['gbdt', 'dart'],
+                'reg_alpha':          [0, 0.1, 1],
+                'reg_lambda':         [0, 0.1, 1],
+                # you can also experiment with more n_estimators here
+            })
+        else:
+            local_grid = self.param_grid[model_key]
+
         best_score = -np.inf
         best_pipe = None
         best_params = None
 
         param_combos = self.generate_param_combinations(
-            {model_key: self.param_grid[model_key]}
+            {model_key: local_grid}
         )[model_key]
 
         for combo in param_combos:
@@ -151,49 +167,56 @@ class NestedCrossVal:
         return self.model_tuning(model_key, X_tr, y_tr, inner_cv)
 
     def outer_loop(self, df, target, model_key, outer_cv, inner_cv, columns_to_remove=None):
-        """
-        Outer CV: for each fold, tune hyper-params (inner), then compute test metrics.
-        Returns a DataFrame of fold-wise metrics + a list of best_param dicts.
-        """
-        X, y = self.separate_features_target(df, target, columns_to_remove)
-        outer_split = StratifiedKFold(n_splits=outer_cv,
-                                      shuffle=True,
-                                      random_state=self.random_state)
+   
+        # Determine which cols to drop
+        columns_to_remove = set(columns_to_remove or []) | {target}
+        feature_cols = [c for c in df.columns if c not in columns_to_remove]
+
+        X_df = df[feature_cols]
+        y_sr = df[target]
+
+        outer_split = StratifiedKFold(
+            n_splits=outer_cv,
+            shuffle=True,
+            random_state=self.random_state
+        )
 
         records = []
         best_params_list = []
 
-        for fold, (train_idx, test_idx) in enumerate(outer_split.split(X, y), 1):
-            X_tr, y_tr = X[train_idx], y[train_idx]
-            X_te, y_te = X[test_idx], y[test_idx]
+        for fold, (train_idx, test_idx) in enumerate(outer_split.split(X_df, y_sr), start=1):
+            # Build fold DataFrames/Series
+            X_tr = X_df.iloc[train_idx]
+            y_tr = y_sr.iloc[train_idx]
+            X_te = X_df.iloc[test_idx]
+            y_te = y_sr.iloc[test_idx]
 
-            # 1) Inner loop: get best pipeline + params
+            # Inner tuning: get the best pipeline and its params
             best_pipe, best_params = self.model_tuning(model_key, X_tr, y_tr, inner_cv)
             best_params_list.append(best_params)
 
-            # 2) Fit on training fold
+            # Fit on the training fold
             best_pipe.fit(X_tr, y_tr)
 
-            # 3) Predict labels & probabilities on test fold
+            # Predictions
             y_pred = best_pipe.predict(X_te)
-            if hasattr(best_pipe.named_steps[best_pipe.steps[-1][0]], "predict_proba"):
-                y_proba = best_pipe.predict_proba(X_te)[:,1]
+            if hasattr(best_pipe, "predict_proba"):
+                y_proba = best_pipe.predict_proba(X_te)[:, 1]
             else:
-                # For SVM without probability=True we can use decision_function
                 y_proba = best_pipe.decision_function(X_te)
 
-            # 4) Compute confusion matrix for specificity/NPV
+            # Confusion-matrix stats
             tn, fp, fn, tp = confusion_matrix(y_te, y_pred).ravel()
+            recall = recall_score(y_te, y_pred)
+            specificity = tn / (tn + fp) if (tn + fp) else np.nan
+            npv = tn / (tn + fn) if (tn + fn) else np.nan
 
-            # 5) Compute metrics
-            precision, recall, _ = precision_recall_curve(y_te, y_proba)
-            pr_auc = auc(recall, precision)
+            # Precision–Recall AUC
+            prec_vals, rec_vals, _ = precision_recall_curve(y_te, y_proba)
+            pr_auc = auc(rec_vals, prec_vals)
 
-            rec = recall_score(y_te, y_pred)                           # sensitivity
-            spec = tn / (tn + fp) if (tn + fp) else np.nan             # specificity
-            npv  = tn / (tn + fn) if (tn + fn) else np.nan             # negative predictive value
-
-            metrics = {
+            # Collect all metrics
+            records.append({
                 'fold': fold,
                 'MCC': matthews_corrcoef(y_te, y_pred),
                 'AUC': roc_auc_score(y_te, y_proba),
@@ -201,14 +224,16 @@ class NestedCrossVal:
                 'BA': balanced_accuracy_score(y_te, y_pred),
                 'F1': f1_score(y_te, y_pred),
                 'F2': fbeta_score(y_te, y_pred, beta=2),
-                'Recall': rec,
-                'Specificity': spec,
+                'Recall': recall,
+                'Specificity': specificity,
                 'Precision': precision_score(y_te, y_pred),
                 'NPV': npv
-            }
-            records.append(metrics)
+            })
 
-        results_df = pd.DataFrame(records).set_index('fold')
-        return results_df, best_params_list
+        metrics_df = pd.DataFrame(records).set_index('fold')
+        return metrics_df, best_params_list
+
+
+
 
 
