@@ -82,7 +82,7 @@ class NestedCrossVal:
                 model_combinations[model] = [
                     dict(zip(params.keys(), values)) for values in itertools.product(*params.values())
                 ]
-        return param_combinations
+        return model_combinations
     
     def separate_features_target(self, df, target, columns_to_remove=None):
         if columns_to_remove is None:
@@ -98,15 +98,13 @@ class NestedCrossVal:
         best_model = None
         best_params = None
 
-        grid = self.param_grid[model_key]
-
-        param_combinations = NestedCrossVal.generate_param_combinations({model_key: self.param_grid[model_key]})[model_key]
+        param_combinations = self.generate_param_combinations({model_key: self.param_grid[model_key]})[model_key]
 
 
-        for params in param_combinations:
+        for combination in param_combinations:
             proto = self.models[model_key]
             proto_params = proto.get_params()
-            proto_params.update(params)
+            proto_params.update(combination)
             estimator = proto.__class__(**proto_params)
 
             pipeline = make_pipeline(StandardScaler(), estimator)
@@ -115,22 +113,22 @@ class NestedCrossVal:
                 scoring='neg_root_mean_squared_error', cv=splitter, n_jobs=n_jobs
             )
             rmse = np.sqrt(-scores.mean())
-            print(f"[{model_key}] Tested {params} -> RMSE {rmse:.4f}")
+            print(f"[{model_key}] Tested {combination} -> RMSE {rmse:.4f}")
             if rmse < best_rmse:
                 best_rmse = rmse
                 best_model = pipeline
-                best_params = params
+                best_params = combination
                 print(f"[{model_key}] New best RMSE {best_rmse:.4f}, params {best_params}")
 
         return best_model, best_params
     
-    def inner_loop(df, target, model_key, columns_to_remove=None, inner_cv=3):
-        X, y = NestedCrossVal.separate_features_target(df, target, columns_to_remove)
-        return NestedCrossVal.model_tuning(model_key, X.values, y.values, inner_cv)
+    def inner_loop(self, df, target, model_key, columns_to_remove=None, inner_cv=3):
+        X, y = self.separate_features_target(df, target, columns_to_remove)
+        return self.model_tuning(model_key, X.values, y.values, inner_cv)
     
-    def outer_loop(df, target, model_key, outer_cv=5, random_state=42, columns_to_remove=None, inner_cv=3):
+    def outer_loop(self, df, target, model_key, outer_cv=5, random_state=42, columns_to_remove=None, inner_cv=3):
         # Separate full features and target once
-        X_full, y_full = NestedCrossVal.separate_features_target(df, target, columns_to_remove)
+        X_full, y_full = self.separate_features_target(df, target, columns_to_remove)
         splitter = StratifiedKFold(n_splits=outer_cv, shuffle=True, random_state=random_state)
         scores = []
         params_per_fold = []
@@ -141,15 +139,15 @@ class NestedCrossVal:
             df_te = df.iloc[test_idx].reset_index(drop=True)
 
             # Inner tuning on training partition
-            best_pipe, best_params = NestedCrossVal.inner_loop(df_tr, target, model_key, columns_to_remove, inner_cv)
+            best_pipe, best_params = self.inner_loop(df_tr, target, model_key, columns_to_remove, inner_cv)
             params_per_fold.append(best_params)
 
             # Extract train arrays for fitting
-            X_tr, y_tr = NestedCrossVal.separate_features_target(df_tr, target, columns_to_remove)
+            X_tr, y_tr = self.separate_features_target(df_tr, target, columns_to_remove)
             X_tr_arr, y_tr_arr = X_tr.values, y_tr.values
 
             # Extract test arrays for evaluation
-            X_te, y_te = NestedCrossVal.separate_features_target(df_te, target, columns_to_remove)
+            X_te, y_te = self.separate_features_target(df_te, target, columns_to_remove)
             X_te_arr, y_te_arr = X_te.values, y_te.values
 
             # Fit pipeline on training data arrays and score on test arrays
