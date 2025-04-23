@@ -401,7 +401,7 @@ class Classifier:
                 best_params = combo_dict
                 print(f"[{model_name}] New best AUC: {best_auc:.4f}")
                 print(f"[{model_name}] Best params so far: {best_params}")
-
+        
         return {
             'Best AUC':    best_auc,
             'Best Model':  best_model,
