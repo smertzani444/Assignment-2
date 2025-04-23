@@ -321,12 +321,15 @@ class Classifier:
         {'kernel': ['rbf'], 'C': [0.1, 1, 10], 'gamma': ['scale', 'auto', 0.01, 0.1]}
     ]
 
-    def load_data(path):
+    def load_data(self, path):
         if not os.path.isfile(path):
             raise FileNotFoundError(f"The file at {path} was not found.")
         return pd.read_csv(path)
 
-    def preprocess_data(df, columns_to_drop=[]):
+    def preprocess_data(self, df, columns_to_drop=None):
+        if columns_to_drop is None:
+            columns_to_drop = []
+
         df=df.drop(columns=[col for col in columns_to_drop if col in df.columns])
         num_list=df.select_dtypes(include=[np.number]).columns.tolist()
         cat_list=df.select_dtypes(exclude=[np.number]).columns.tolist()
@@ -340,7 +343,7 @@ class Classifier:
     
         return df
     
-    def separate_features_target(df, target, columns_to_remove=None):
+    def separate_features_target(self, df, target, columns_to_remove=None):
         if columns_to_remove is None:
             columns_to_remove=[]
         columns_to_remove=set(columns_to_remove + [target])
@@ -354,7 +357,7 @@ class Classifier:
         print(f"The selected features of {X.shape[1]} were: {len(selected_features)}")
         return selected_features, correlations
 
-    def generate_param_combintions(self, param_grid):
+    def generate_param_combinations(self, param_grid):
         combos = []
         # ensure we have a list of grids
         if isinstance(param_grid, list): 
@@ -369,22 +372,17 @@ class Classifier:
 
         return combos
 
-    def model_tuning(self, model, param_grid, save_path, X, y, cv=5):
+    def model_tuning(self, model, X, y, param_grid, cv):
         best_auc    = 0.0
         best_model  = None
         best_params = None
+        model_name  = model.__name__ if isinstance(model, type) else model.__class__.__name__
 
-        if isinstance(model, type):
-            model_name  = model.__name__ 
-        else:
-            model_name = model.__class__.__name__
+        combos = self.generate_param_combinations(param_grid)
 
-        # loop over every combo
-        for combo in itertools.product(*param_grid.values()):
-            combo_dict = dict(zip(param_grid.keys(), combo))
-            # instantiate directly from the passed-in model
+        # now just loop over that list
+        for combo_dict in combos:
             model_instance = model(**combo_dict)
-
             scores = cross_val_score(
                 model_instance,
                 X, y,
@@ -393,27 +391,23 @@ class Classifier:
             )
             auc = scores.mean()
 
-            print(f"[{model}] Tested params: {combo_dict}")
-            print(f"[{model}] AUC: {auc:.4f}")
+            print(f"[{model_name}] Tested params: {combo_dict}")
+            print(f"[{model_name}] AUC: {auc:.4f}")
 
-        if auc > best_auc:
-                best_auc = auc
-                best_model = model_instance
+            # keep this check *inside* the combo loop
+            if auc > best_auc:
+                best_auc    = auc
+                best_model  = model_instance
                 best_params = combo_dict
-                print(f"[{model}] New best AUC: {best_auc:.4f}")
-                print(f"[{model}] Best params so far: {best_params}")
-
-        if save_path is not None and best_model is not None:
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            joblib.dump(best_model, save_path)
-            print(f"Best model (highest AUC: {best_auc:.4f}) saved to {save_path}")
-
+                print(f"[{model_name}] New best AUC: {best_auc:.4f}")
+                print(f"[{model_name}] Best params so far: {best_params}")
 
         return {
-            'Best AUC': best_auc,
-            'Best Model': best_model,
+            'Best AUC':    best_auc,
+            'Best Model':  best_model,
             'Best Params': best_params
         }
+
     
     def train_tuned_model(self, model, X, y, scale=True):
         # split
