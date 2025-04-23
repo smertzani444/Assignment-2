@@ -99,6 +99,10 @@ class NestedCrossVal:
         """
         Expand param_grid into all combos per model.
         """
+        # new: detect “single-model” usage
+        if isinstance(param_grid, list):
+            param_grid = {'__single__': param_grid}
+
         model_combinations = {}
         for model, params in param_grid.items():
             if isinstance(params, list):
