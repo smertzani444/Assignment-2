@@ -257,24 +257,56 @@ class NestedCrossVal:
         metrics_df = pd.DataFrame(records).set_index('fold')
         return metrics_df, best_params_list
 
-    def run_repeated_nested_cv(self, df, target, outer_cv, inner_cv, num_rounds, columns_to_remove=None):
-        results = {}
-        for model_key in self.models:
-            all_df, all_params = [], []
-            for r in range(num_rounds):
-                dfm, plist = self.outer_loop(df, target, model_key, outer_cv, inner_cv, columns_to_remove)
-                dfm['repeat'] = r+1  # 1-based round index
-                all_df.append(dfm); all_params.extend(plist)
-            full = pd.concat(all_df, ignore_index=True)
-            # keep 'repeat' and 'fold'
-            metrics = full.drop(columns=['repeat','fold'])
-            summary = pd.DataFrame({
-                'median': metrics.median(),
-                'ci_lower': metrics.quantile(0.025),
-                'ci_upper': metrics.quantile(0.975)
-            })
-            results[model_key] = {'metrics': full, 'summary': summary, 'best_params': all_params}
-        return results
+    def run_repeated_nested_cv(self, df, target, model_key, outer_cv, inner_cv, num_rounds, columns_to_remove=None):
+        """
+        Run repeated nested CV for a single specified model.
+
+        Parameters
+        ----------
+        df : DataFrame
+            Full dataset.
+        target : str
+            Name of the target column.
+        model_key : str
+            Key identifying which model in self.models to run.
+        outer_cv : int
+            Number of outer folds.
+        inner_cv : int
+            Number of inner folds.
+        num_rounds : int
+            Number of times to repeat the nested CV.
+        columns_to_remove : list, optional
+            Columns to drop before CV.
+
+        Returns
+        -------
+        dict
+            {'metrics': DataFrame of num_rounds×outer_cv rows,
+             'summary': DataFrame with median and 95% CI per metric,
+             'best_params': list of param dicts per outer fold per round}
+        """
+        all_df = []
+        all_params = []
+        for r in range(num_rounds):
+            dfm, plist = self.outer_loop(
+                df, target, model_key,
+                outer_cv, inner_cv, columns_to_remove
+            )
+            # bring fold index into column before concatenation
+            dfm = dfm.reset_index()
+            dfm['repeat'] = r + 1
+            all_df.append(dfm)
+            all_params.extend(plist)
+        # concatenate all rounds retaining both 'fold' and 'repeat'
+        full = pd.concat(all_df, ignore_index=True)
+        metrics = full.drop(columns=['repeat','fold'])
+        summary = pd.DataFrame({
+            'median': metrics.median(),
+            'ci_lower': metrics.quantile(0.025),
+            'ci_upper': metrics.quantile(0.975)
+        })
+        return {'metrics': full, 'summary': summary, 'best_params': all_params}
+
 
 
 
