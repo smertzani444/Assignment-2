@@ -14,9 +14,8 @@ from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
 from sklearn.model_selection import GridSearchCV, cross_val_score, KFold, StratifiedKFold
 from sklearn.pipeline import Pipeline 
 from sklearn.pipeline import make_pipeline
-from sklearn.metrics import make_scorer, f1_score, roc_auc_score
+from sklearn.metrics import fbeta_score, matthews_corrcoef, roc_auc_score, balanced_accuracy_score, f1_score, recall_score, precision_score, precision_recall_curve, auc, confusion_matrix
 from sklearn.base import clone
-from typing import Any, Callable, Dict, List, Tuple, Union
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import GaussianNB
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -25,18 +24,42 @@ from sklearn.ensemble import RandomForestClassifier
 from lightgbm import LGBMClassifier
 
 class NestedCrossVal:
-    def __init__(self):
+    def __init__(
+        self,
+        R: int = 10,
+        N: int = 5,
+        K: int = 3,
+        random_state: int = 42,
+        n_jobs: int = 1
+    ):
+        """
+        Initialize repeated nested cross-validation with default models.
+
+        Parameters
+        ----------
+        R : int
+            Number of repetitions of the full nested CV.
+        N : int
+            Number of outer folds.
+        K : int
+            Number of inner folds.
+        random_state : int
+            Seed for reproducibility.
+        n_jobs : int
+            Number of parallel jobs for CV.
+        """
+        # Initialize default models
         self.models = {
             'LogisticRegression-elasticnet': LogisticRegression(
-            penalty='elasticnet', solver='saga', random_state=0, max_iter=10000
+                penalty='elasticnet', solver='saga', random_state=random_state, max_iter=10000
             ),
             'GaussianNB': GaussianNB(),
             'LDA': LinearDiscriminantAnalysis(),
-            'SVC': SVC(random_state=0),
-            'RandomForest': RandomForestClassifier(random_state=0),
-            'LightGBM': LGBMClassifier(random_state=0)
+            'SVC': SVC(random_state=random_state, probability=True),
+            'RandomForest': RandomForestClassifier(random_state=random_state),
+            'LightGBM': LGBMClassifier(random_state=random_state)
         }
-
+        # Default hyperparameter grids
         self.param_grid = {
             'LogisticRegression-elasticnet': {
                 'C': [0.01, 0.1, 1, 10],
@@ -66,93 +89,224 @@ class NestedCrossVal:
                 'max_depth': [-1, 10, 20]
             }
         }
+        self.R = R
+        self.N = N
+        self.K = K
+        self.random_state = random_state
+        self.n_jobs = n_jobs
 
     def generate_param_combinations(self, param_grid):
+        """
+        Expand param_grid into all combos per model.
+        """
+        # detect “winner-model” usage
+        if isinstance(param_grid, list):
+            param_grid = {'__winner__': param_grid}
+
         model_combinations = {}
         for model, params in param_grid.items():
-        
             if isinstance(params, list):
-                param_combinations = []
-                for param_set in params:
-                    param_combinations.extend(
-                        [dict(zip(param_set.keys(), values)) for values in itertools.product(*param_set.values())]
-                    )
-                model_combinations[model] = param_combinations
+                combos = []
+                for pset in params:
+                    keys, vals = zip(*pset.items())
+                    for v in itertools.product(*vals):
+                        combos.append(dict(zip(keys, v)))
+                model_combinations[model] = combos
             else:
-                model_combinations[model] = [
-                    dict(zip(params.keys(), values)) for values in itertools.product(*params.values())
-                ]
+                keys, vals = zip(*params.items())
+                model_combinations[model] = [dict(zip(keys, v)) for v in itertools.product(*vals)]
         return model_combinations
-    
+
     def separate_features_target(self, df, target, columns_to_remove=None):
-        if columns_to_remove is None:
-            columns_to_remove=[]
-        columns_to_remove=set(columns_to_remove + [target])
-        X=df.drop(columns=[col for col in columns_to_remove if col in df.columns])
-        y=df[target]
-        return X, y
-    
-    def model_tuning(self, model_key, X_train, y_train, inner_cv=3, random_state=42, n_jobs=1):
-        splitter = StratifiedKFold(n_splits=inner_cv, shuffle=True, random_state=random_state)
-        best_rmse = float('inf')
-        best_model = None
+        """
+        Splits DataFrame into feature matrix X and target y.
+        """
+        cols_to_drop = set(columns_to_remove or []) | {target}
+        X = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
+        y = df[target]
+        return X.values, y.values
+
+    def model_tuning(self, model_key, X_train, y_train, inner_cv):
+        """
+        Run inner CV hyperparameter search for one model.
+        Uses self.random_state and self.n_jobs internally.
+        """
+        inner_split = StratifiedKFold(
+            n_splits=inner_cv,
+            shuffle=True,
+            random_state=self.random_state
+        )
+
+        if model_key == 'LightGBM':
+            # compute imbalance ratio on this fold's training data
+            neg, pos = np.bincount(y_train)
+            ratio = neg / pos
+            # make a shallow copy of the param grid so we don't pollute self.param_grid permanently
+            local_grid = dict(self.param_grid['LightGBM'])
+            local_grid.update({
+                'scale_pos_weight': [ratio, 1.0],
+                'boosting_type':      ['gbdt', 'dart'],
+                'reg_alpha':          [0, 0.1, 1],
+                'reg_lambda':         [0, 0.1, 1],
+                # you can also experiment with more n_estimators here
+            })
+        else:
+            local_grid = self.param_grid[model_key]
+
+        best_score = -np.inf
+        best_pipe = None
         best_params = None
 
-        param_combinations = self.generate_param_combinations({model_key: self.param_grid[model_key]})[model_key]
+        param_combos = self.generate_param_combinations(
+            {model_key: local_grid}
+        )[model_key]
 
-
-        for combination in param_combinations:
+        for combo in param_combos:
             proto = self.models[model_key]
-            proto_params = proto.get_params()
-            proto_params.update(combination)
-            estimator = proto.__class__(**proto_params)
+            p = proto.get_params()
+            p.update(combo)
+            est = proto.__class__(**p)
+            pipeline = make_pipeline(StandardScaler(), est)
 
-            pipeline = make_pipeline(StandardScaler(), estimator)
-            scores = cross_val_score(
-                pipeline, X_train, y_train,
-                scoring='neg_root_mean_squared_error', cv=splitter, n_jobs=n_jobs
+            aucs = cross_val_score(
+                pipeline,
+                X_train,
+                y_train,
+                scoring='roc_auc',
+                cv=inner_split,
+                n_jobs=self.n_jobs
             )
-            rmse = np.sqrt(-scores.mean())
-            print(f"[{model_key}] Tested {combination} -> RMSE {rmse:.4f}")
-            if rmse < best_rmse:
-                best_rmse = rmse
-                best_model = pipeline
-                best_params = combination
-                print(f"[{model_key}] New best RMSE {best_rmse:.4f}, params {best_params}")
+            mean_auc = aucs.mean()
+            print(f"[{model_key}] Tested {combo} -> AUC {mean_auc:.4f}")
 
-        return best_model, best_params
-    
+            if mean_auc > best_score:
+                best_score, best_params = mean_auc, combo
+                best_pipe = pipeline
+                print(f"[{model_key}] New best AUC {mean_auc:.4f}, params {combo}")
+
+        # Return the (unfitted) pipeline and the best params dict:
+        return best_pipe, best_params
+
     def inner_loop(self, df, target, model_key, columns_to_remove=None, inner_cv=3):
-        X, y = self.separate_features_target(df, target, columns_to_remove)
-        return self.model_tuning(model_key, X.values, y.values, inner_cv)
-    
-    def outer_loop(self, df, target, model_key, outer_cv=5, random_state=42, columns_to_remove=None, inner_cv=3):
-        # Separate full features and target once
-        X_full, y_full = self.separate_features_target(df, target, columns_to_remove)
-        splitter = StratifiedKFold(n_splits=outer_cv, shuffle=True, random_state=random_state)
-        scores = []
-        params_per_fold = []
+        """
+        Extract train data and run model_tuning.
+        """
+        X_tr, y_tr = self.separate_features_target(df, target, columns_to_remove)
+        return self.model_tuning(model_key, X_tr, y_tr, inner_cv)
 
-        for train_idx, test_idx in splitter.split(X_full.values, y_full.values):
-            # Partition DataFrame
-            df_tr = df.iloc[train_idx].reset_index(drop=True)
-            df_te = df.iloc[test_idx].reset_index(drop=True)
+    def outer_loop(self, df, target, model_key, outer_cv, inner_cv, columns_to_remove=None):
+   
+        # Determine which cols to drop
+        columns_to_remove = set(columns_to_remove or []) | {target}
+        feature_cols = [c for c in df.columns if c not in columns_to_remove]
 
-            # Inner tuning on training partition
-            best_pipe, best_params = self.inner_loop(df_tr, target, model_key, columns_to_remove, inner_cv)
-            params_per_fold.append(best_params)
+        X_df = df[feature_cols]
+        y_sr = df[target]
 
-            # Extract train arrays for fitting
-            X_tr, y_tr = self.separate_features_target(df_tr, target, columns_to_remove)
-            X_tr_arr, y_tr_arr = X_tr.values, y_tr.values
+        outer_split = StratifiedKFold(
+            n_splits=outer_cv,
+            shuffle=True,
+            random_state=self.random_state
+        )
 
-            # Extract test arrays for evaluation
-            X_te, y_te = self.separate_features_target(df_te, target, columns_to_remove)
-            X_te_arr, y_te_arr = X_te.values, y_te.values
+        records = []
+        best_params_list = []
 
-            # Fit pipeline on training data arrays and score on test arrays
-            best_pipe.fit(X_tr_arr, y_tr_arr)
-            score = best_pipe.score(X_te_arr, y_te_arr)
-            scores.append(score)
+        for fold, (train_idx, test_idx) in enumerate(outer_split.split(X_df, y_sr), start=1):
+            # Build fold DataFrames/Series
+            X_tr = X_df.iloc[train_idx]
+            y_tr = y_sr.iloc[train_idx]
+            X_te = X_df.iloc[test_idx]
+            y_te = y_sr.iloc[test_idx]
 
-        return scores, params_per_fold
+            # Inner tuning: get the best pipeline and its params
+            best_pipe, best_params = self.model_tuning(model_key, X_tr, y_tr, inner_cv)
+            best_params_list.append(best_params)
+
+            # Fit on the training fold
+            best_pipe.fit(X_tr, y_tr)
+
+            # Predictions
+            y_pred = best_pipe.predict(X_te)
+            if hasattr(best_pipe, "predict_proba"):
+                y_proba = best_pipe.predict_proba(X_te)[:, 1]
+            else:
+                y_proba = best_pipe.decision_function(X_te)
+
+            # Confusion-matrix stats
+            tn, fp, fn, tp = confusion_matrix(y_te, y_pred).ravel()
+            recall = recall_score(y_te, y_pred)
+            specificity = tn / (tn + fp) if (tn + fp) else np.nan
+            npv = tn / (tn + fn) if (tn + fn) else np.nan
+
+            # Precision–Recall AUC
+            prec_vals, rec_vals, _ = precision_recall_curve(y_te, y_proba)
+            pr_auc = auc(rec_vals, prec_vals)
+
+            # Collect all metrics
+            records.append({
+                'fold': fold,
+                'MCC': matthews_corrcoef(y_te, y_pred),
+                'AUC': roc_auc_score(y_te, y_proba),
+                'PRAUC': pr_auc,
+                'BA': balanced_accuracy_score(y_te, y_pred),
+                'F1': f1_score(y_te, y_pred),
+                'F2': fbeta_score(y_te, y_pred, beta=2),
+                'Recall': recall,
+                'Specificity': specificity,
+                'Precision': precision_score(y_te, y_pred),
+                'NPV': npv
+            })
+
+        metrics_df = pd.DataFrame(records).set_index('fold')
+        return metrics_df, best_params_list
+
+    def run_repeated_nested_cv(self, df, target, model_key, outer_cv, inner_cv, num_rounds, columns_to_remove=None):
+        """
+        Run repeated nested CV for a single specified model.
+
+        Parameters
+        ----------
+        df : DataFrame
+            Full dataset.
+        target : str
+            Name of the target column.
+        model_key : str
+            Key identifying which model in self.models to run.
+        outer_cv : int
+            Number of outer folds.
+        inner_cv : int
+            Number of inner folds.
+        num_rounds : int
+            Number of times to repeat the nested CV.
+        columns_to_remove : list, optional
+            Columns to drop before CV.
+
+        Returns
+        -------
+        dict
+            {'metrics': DataFrame of num_rounds×outer_cv rows,
+             'summary': DataFrame with median and 95% CI per metric,
+             'best_params': list of param dicts per outer fold per round}
+        """
+        all_df = []
+        all_params = []
+        for r in range(num_rounds):
+            dfm, plist = self.outer_loop(
+                df, target, model_key,
+                outer_cv, inner_cv, columns_to_remove
+            )
+            # bring fold index into column before concatenation
+            dfm = dfm.reset_index()
+            dfm['repeat'] = r + 1
+            all_df.append(dfm)
+            all_params.extend(plist)
+        # concatenate all rounds retaining both 'fold' and 'repeat'
+        full = pd.concat(all_df, ignore_index=True)
+        metrics = full.drop(columns=['repeat','fold'])
+        summary = pd.DataFrame({
+            'median': metrics.median(),
+            'ci_lower': metrics.quantile(0.025),
+            'ci_upper': metrics.quantile(0.975)
+        })
+        return {'metrics': full, 'summary': summary, 'best_params': all_params}

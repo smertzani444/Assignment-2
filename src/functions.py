@@ -99,9 +99,9 @@ class NestedCrossVal:
         """
         Expand param_grid into all combos per model.
         """
-        # new: detect “single-model” usage
+        # detect “winner-model” usage
         if isinstance(param_grid, list):
-            param_grid = {'__single__': param_grid}
+            param_grid = {'__winner__': param_grid}
 
         model_combinations = {}
         for model, params in param_grid.items():
@@ -312,7 +312,208 @@ class NestedCrossVal:
         return {'metrics': full, 'summary': summary, 'best_params': all_params}
 
 
+class Classifier:
+    def __init__(self):
+        self.model = SVC(random_state=0)
 
+        self.param_grid = [
+        {'kernel': ['linear'], 'C': [0.1, 1, 10]},
+        {'kernel': ['rbf'], 'C': [0.1, 1, 10], 'gamma': ['scale', 'auto', 0.01, 0.1]}
+    ]
+
+    def load_data(path):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"The file at {path} was not found.")
+        return pd.read_csv(path)
+
+    def preprocess_data(df, columns_to_drop=[]):
+        df=df.drop(columns=[col for col in columns_to_drop if col in df.columns])
+        num_list=df.select_dtypes(include=[np.number]).columns.tolist()
+        cat_list=df.select_dtypes(exclude=[np.number]).columns.tolist()
+
+        for col in cat_list:
+            df[col]=LabelEncoder().fit_transform(df[col])
+
+        for col in num_list:
+            df[col]=SimpleImputer(missing_values=np.nan, strategy='mean') \
+                .fit_transform(df[[col]]).ravel()
+    
+        return df
+    
+    def separate_features_target(df, target, columns_to_remove=None):
+        if columns_to_remove is None:
+            columns_to_remove=[]
+        columns_to_remove=set(columns_to_remove + [target])
+        X=df.drop(columns=[col for col in columns_to_remove if col in df.columns])
+        y=df[target]
+        return X, y
+
+    def select_features(self, X, y, threshold=0.1):
+        correlations = pd.Series(r_regression(X, y), index=X.columns)
+        selected_features = correlations[correlations.abs() >= threshold].index.tolist()
+        print(f"The selected features of {X.shape[1]} were: {len(selected_features)}")
+        return selected_features, correlations
+
+    def generate_param_combintions(self, param_grid):
+        combos = []
+        # ensure we have a list of grids
+        if isinstance(param_grid, list): 
+            grids = param_grid 
+        else:
+            grids = [param_grid]
+
+        for grid in grids:
+            keys, values = zip(*grid.items())
+            for vals in itertools.product(*values):
+                combos.append(dict(zip(keys, vals)))
+
+        return combos
+
+    def model_tuning(self, model, param_grid, save_path, X, y, cv=5):
+        best_auc    = 0.0
+        best_model  = None
+        best_params = None
+
+        if isinstance(model, type):
+            model_name  = model.__name__ 
+        else:
+            model_name = model.__class__.__name__
+
+        # loop over every combo
+        for combo in itertools.product(*param_grid.values()):
+            combo_dict = dict(zip(param_grid.keys(), combo))
+            # instantiate directly from the passed-in model
+            model_instance = model(**combo_dict)
+
+            scores = cross_val_score(
+                model_instance,
+                X, y,
+                scoring='roc_auc',
+                cv=cv
+            )
+            auc = scores.mean()
+
+            print(f"[{model}] Tested params: {combo_dict}")
+            print(f"[{model}] AUC: {auc:.4f}")
+
+        if auc > best_auc:
+                best_auc = auc
+                best_model = model_instance
+                best_params = combo_dict
+                print(f"[{model}] New best AUC: {best_auc:.4f}")
+                print(f"[{model}] Best params so far: {best_params}")
+
+        if save_path is not None and best_model is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            joblib.dump(best_model, save_path)
+            print(f"Best model (highest AUC: {best_auc:.4f}) saved to {save_path}")
+
+
+        return {
+            'Best AUC': best_auc,
+            'Best Model': best_model,
+            'Best Params': best_params
+        }
+    
+    def train_tuned_model(self, model, X, y, scale=True):
+        # split
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.3, random_state=42
+        )
+
+        # scale if requested
+        if scale:
+            scaler = StandardScaler()
+            X_train = scaler.fit_transform(X_train)
+            X_test = scaler.transform(X_test)
+    
+        # fit
+        model.fit(X_train, y_train)
+
+        # get prediction scores
+        if hasattr(model, "predict_proba"):
+            # binary: take probability of class “1”
+            y_scores = model.predict_proba(X_test)[:, 1]
+        else:
+            # e.g. SVM with decision_function
+            y_scores = model.decision_function(X_test)
+
+        # compute AUC
+        auc = roc_auc_score(y_test, y_scores)
+        print(f"Model: {model.__class__.__name__} AUC: {auc:.4f}")
+
+        return auc
+
+    def summarize(self, scores):
+        mean = np.mean(scores)
+        std = np.std(scores, ddof=1)
+        ci95 = t.interval(0.95, len(scores) - 1, loc=mean, scale=std / np.sqrt(len(scores)))
+        return {
+            'mean': mean,
+            'median': np.median(scores),
+            '95% CI': ci95
+        }
+
+    
+    def align_evaluation_set(self, dev_df, val_df):
+        dev_columns = dev_df.columns
+        val_aligned = val_df.copy()
+        val_aligned = val_aligned.reindex(columns=dev_columns, fill_value=0)
+        print("Evaluation dataset was aligned to development feature set.")
+        return val_aligned
+    
+
+    def evaluate_model(self, model, X, y, runs=30, test_size=0.2, scale=True, save_path=None):
+        metrics = {
+            'rmse': [],
+            'mae': [],
+            'r2': []
+        }
+
+        best_rmse = float('inf')
+        best_model = None
+
+        for i in range(runs):
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size)
+            if scale:
+                scaler=StandardScaler()
+                X_train=scaler.fit_transform(X_train)
+                model.fit(X_train, y_train)
+                X_test=scaler.fit_transform(X_test)
+                y_pred = model.predict(X_test)
+             
+            else:
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_test)
+
+            rmse = root_mean_squared_error(y_test, y_pred)
+            mae = mean_absolute_error(y_test, y_pred)
+            r2 = r2_score(y_test, y_pred)
+
+            metrics['rmse'].append(rmse)
+            metrics['mae'].append(mae)
+            metrics['r2'].append(r2)
+
+        # Track the best model
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best_model = copy.deepcopy(model)
+
+        results = {k: self.summarize(v) for k, v in metrics.items()}
+
+        if save_path is not None and best_model is not None:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            joblib.dump(best_model, save_path)
+            print(f"Best model (lowest RMSE: {best_rmse:.4f}) saved to {save_path}")
+
+        for metric, values in metrics.items():
+            plt.figure(figsize=(8, 6))
+            sns.boxplot(y=values)
+            plt.title(f"{metric.upper()} Distribution")
+            plt.ylabel(metric.upper())
+            plt.show()
+
+        return results
 
 
 
