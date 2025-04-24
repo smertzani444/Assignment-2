@@ -14,7 +14,7 @@ from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
 from sklearn.model_selection import GridSearchCV, cross_val_score, KFold, StratifiedKFold
 from sklearn.pipeline import Pipeline 
 from sklearn.pipeline import make_pipeline
-from sklearn.metrics import fbeta_score, matthews_corrcoef, roc_auc_score, balanced_accuracy_score, f1_score, recall_score, precision_score, precision_recall_curve, auc, confusion_matrix
+from sklearn.metrics import average_precision_score, fbeta_score, matthews_corrcoef, roc_auc_score, balanced_accuracy_score, f1_score, recall_score, precision_score, precision_recall_curve, auc, confusion_matrix
 from sklearn.base import clone
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import GaussianNB
@@ -409,7 +409,7 @@ class Classifier:
         }
 
     
-    def train_tuned_model(self, model, X, y, scale=True):
+    def train_tuned_model(self, model, X, y, save_path, scale=True):
         # split
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.3, random_state=42
@@ -437,6 +437,24 @@ class Classifier:
         print(f"Model: {model.__class__.__name__} AUC: {auc:.4f}")
 
         return auc
+    
+    def train_final_model(self, model, X, y, save_path, scale=True):
+        # optional global scaling
+        if scale:
+            scaler = StandardScaler()
+            X = scaler.fit_transform(X)
+
+        # fit on all available data
+        model.fit(X, y)
+
+        # persist
+        folder = os.path.dirname(save_path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        joblib.dump(model, save_path)
+        print(f"Final model trained on all data and saved to {save_path}")
+
+        return model
 
     def summarize(self, scores):
         mean = np.mean(scores)
@@ -459,12 +477,12 @@ class Classifier:
 
     def evaluate_model(self, model, X, y, runs=30, test_size=0.2, scale=True, save_path=None):
         metrics = {
-            'rmse': [],
-            'mae': [],
-            'r2': []
+            'auc':   [],
+            'prauc': [],
+            'mcc':   []
         }
 
-        best_rmse = float('inf')
+        best_auc = 0.0
         best_model = None
 
         for i in range(runs):
@@ -480,25 +498,33 @@ class Classifier:
                 model.fit(X_train, y_train)
                 y_pred = model.predict(X_test)
 
-            rmse = root_mean_squared_error(y_test, y_pred)
-            mae = mean_absolute_error(y_test, y_pred)
-            r2 = r2_score(y_test, y_pred)
+            if hasattr(model, "predict_proba"):
+                y_scores = model.predict_proba(X_test)[:, 1]
+            else:
+                y_scores = model.decision_function(X_test)
 
-            metrics['rmse'].append(rmse)
-            metrics['mae'].append(mae)
-            metrics['r2'].append(r2)
-
-        # Track the best model
-            if rmse < best_rmse:
-                best_rmse = rmse
-                best_model = copy.deepcopy(model)
-
+            auc_val   = roc_auc_score(y_test, y_scores)
+            prauc_val = average_precision_score(y_test, y_scores)
+            mcc_val   = matthews_corrcoef(y_test, y_pred)
+            
+            metrics['auc'].append(auc_val)
+            metrics['prauc'].append(prauc_val)
+            metrics['mcc'].append(mcc_val)
+            
+            print(f"[Run {i+1}] AUC: {auc_val:.4f}, PR AUC: {prauc_val:.4f}, MCC: {mcc_val:.4f}")
+            
+            # Track the best model
+            if auc_val > best_auc:
+                best_auc   = auc_val
+                best_model = np.copy.deepcopy(model)
+                print(f"  ↳ New best model (AUC={best_auc:.4f})")
+        
         results = {k: self.summarize(v) for k, v in metrics.items()}
 
         if save_path is not None and best_model is not None:
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             joblib.dump(best_model, save_path)
-            print(f"Best model (lowest RMSE: {best_rmse:.4f}) saved to {save_path}")
+            print(f"Best model (highest AUC: {best_auc:.4f}) saved to {save_path}")
 
         for metric, values in metrics.items():
             plt.figure(figsize=(8, 6))
