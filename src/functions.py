@@ -316,11 +316,15 @@ class NestedCrossVal:
 
 class Classifier:
     def __init__(self):
-        self.model = SVC(random_state=0)
+        self.model = LogisticRegression(penalty='elasticnet', solver='saga', random_state=0, max_iter=10000)
 
-        self.param_grid = [
-        {'kernel': ['linear'], 'C': [0.1, 1, 10]},
-        {'kernel': ['rbf'], 'C': [0.1, 1, 10], 'gamma': ['scale', 'auto', 0.01, 0.1]}
+        self.param_grid = [{
+      'penalty': ['elasticnet'],
+      'C':       [0.01, 0.1, 1, 10],
+      'l1_ratio':[0.0, 0.25, 0.5, 0.75, 1.0],
+      'solver': ['saga'],
+      'max_iter': [10000]   # saga can be slower; give it more room
+    }
     ]
 
     def load_data(self, path):
