@@ -1,3 +1,4 @@
+import optuna
 import pandas as pd
 import numpy as np
 import joblib
@@ -21,7 +22,7 @@ from sklearn.naive_bayes import GaussianNB
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
-from lightgbm import LGBMClassifier
+import lightgbm as lgb
 
 class NestedCrossVal:
     def __init__(
@@ -57,7 +58,7 @@ class NestedCrossVal:
             'LDA': LinearDiscriminantAnalysis(),
             'SVC': SVC(random_state=random_state, probability=True),
             'RandomForest': RandomForestClassifier(random_state=random_state),
-            'LightGBM': LGBMClassifier(random_state=random_state)
+            'LightGBM': lgb.LGBMClassifier(random_state=random_state)
         }
         # Default hyperparameter grids
         self.param_grid = {
@@ -186,7 +187,8 @@ class NestedCrossVal:
 
         # Return the (unfitted) pipeline and the best params dict:
         return best_pipe, best_params
-
+    
+    
     def inner_loop(self, df, target, model_key, columns_to_remove=None, inner_cv=3):
         """
         Extract train data and run model_tuning.
@@ -259,7 +261,7 @@ class NestedCrossVal:
             })
 
         metrics_df = pd.DataFrame(records).set_index('fold')
-        return metrics_df, best_params_list
+        return metrics_df, best_params_list, y_te, y_pred
 
     def run_repeated_nested_cv(self, df, target, model_key, outer_cv, inner_cv, num_rounds, columns_to_remove=None):
         """
@@ -292,7 +294,7 @@ class NestedCrossVal:
         all_df = []
         all_params = []
         for r in range(num_rounds):
-            dfm, plist = self.outer_loop(
+            dfm, plist, y_te, y_pred = self.outer_loop(
                 df, target, model_key,
                 outer_cv, inner_cv, columns_to_remove
             )
