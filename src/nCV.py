@@ -1,3 +1,4 @@
+import optuna
 import pandas as pd
 import numpy as np
 import joblib
@@ -14,14 +15,20 @@ from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
 from sklearn.model_selection import GridSearchCV, cross_val_score, KFold, StratifiedKFold
 from sklearn.pipeline import Pipeline 
 from sklearn.pipeline import make_pipeline
-from sklearn.metrics import fbeta_score, matthews_corrcoef, roc_auc_score, balanced_accuracy_score, f1_score, recall_score, precision_score, precision_recall_curve, auc, confusion_matrix
+from sklearn.metrics import average_precision_score, fbeta_score, matthews_corrcoef, roc_auc_score, balanced_accuracy_score, f1_score, recall_score, precision_score, precision_recall_curve, auc, confusion_matrix
 from sklearn.base import clone
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import GaussianNB
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
-from lightgbm import LGBMClassifier
+import lightgbm as lgb
+
+# **Note that the methods designed for the previous assignment that were employed
+# in this assignment may have been slightly modifiedin order to fit in this assignment as well or slightly improved 
+# **Note that the methods designed for the previous assignment that were employed
+# in this assignment take as input the argument **model**, whereas the methods created for this assignment 
+# take as input the argument **model_key**, which is ultimately the same
 
 class NestedCrossVal:
     def __init__(
@@ -38,11 +45,11 @@ class NestedCrossVal:
         Parameters
         ----------
         R : int
-            Number of repetitions of the full nested CV.
+            Number of rounds for the nCV.
         N : int
-            Number of outer folds.
+            Number of outer fold loops.
         K : int
-            Number of inner folds.
+            Number of inner fold loops.
         random_state : int
             Seed for reproducibility.
         n_jobs : int
@@ -57,9 +64,10 @@ class NestedCrossVal:
             'LDA': LinearDiscriminantAnalysis(),
             'SVC': SVC(random_state=random_state, probability=True),
             'RandomForest': RandomForestClassifier(random_state=random_state),
-            'LightGBM': LGBMClassifier(random_state=random_state)
+            'LightGBM': lgb.LGBMClassifier(random_state=random_state)
         }
-        # Default hyperparameter grids
+        
+        # Default hyperparameter spaces for each classifier that will be used for tuning
         self.param_grid = {
             'LogisticRegression-elasticnet': {
                 'C': [0.01, 0.1, 1, 10],
@@ -102,18 +110,35 @@ class NestedCrossVal:
         # detect “winner-model” usage
         if isinstance(param_grid, list):
             param_grid = {'__winner__': param_grid}
-
+        
+        # prepare the output dictionary 
+        # keys are model names, values are list of hyperparameters combination dicts
         model_combinations = {}
+
+        # iterate over each model name and its associated hyperparameters combinations 
+        # iterate over each (model, params) pair in the param_grid
         for model, params in param_grid.items():
+            # if params is a list of multiple grids,
+            # handle each grid separately
             if isinstance(params, list):
                 combos = []
+                # iterate through each parameter grid dictionary in the list
+                # pset = set of parameters 
                 for pset in params:
+                    # concept of itertools.product -> we used it on the unpacked lists of values to 
+                    # generate every combination and then zip back with keys to yield concrete parameter-setting dict
+                    # unzip the dict into parallel sequences of keys and lists-of-values
                     keys, vals = zip(*pset.items())
                     for v in itertools.product(*vals):
+                        # zip back into a dict mapping each key to one chosen value
                         combos.append(dict(zip(keys, v)))
                 model_combinations[model] = combos
+
+            # if params is a single dict, expand directly
             else:
+                # separate parameter names and their candidate values
                 keys, vals = zip(*params.items())
+                # build one config dict per combination of values
                 model_combinations[model] = [dict(zip(keys, v)) for v in itertools.product(*vals)]
         return model_combinations
 
@@ -131,43 +156,37 @@ class NestedCrossVal:
         Run inner CV hyperparameter search for one model.
         Uses self.random_state and self.n_jobs internally.
         """
+        # we used StratifiedKFold because we took into account that the dataset was slightly imbalanced and we want the folds
+        # we crate to reflect the whole dataset's class imbalance
+        # shuffle=True, shuffle before splitting
         inner_split = StratifiedKFold(
             n_splits=inner_cv,
             shuffle=True,
             random_state=self.random_state
         )
-
-        if model_key == 'LightGBM':
-            # compute imbalance ratio on this fold's training data
-            neg, pos = np.bincount(y_train)
-            ratio = neg / pos
-            # make a shallow copy of the param grid so we don't pollute self.param_grid permanently
-            local_grid = dict(self.param_grid['LightGBM'])
-            local_grid.update({
-                'scale_pos_weight': [ratio, 1.0],
-                'boosting_type':      ['gbdt', 'dart'],
-                'reg_alpha':          [0, 0.1, 1],
-                'reg_lambda':         [0, 0.1, 1],
-                # you can also experiment with more n_estimators here
-            })
-        else:
-            local_grid = self.param_grid[model_key]
-
+        
+        local_grid = self.param_grid[model_key]
+        
+        # initialize best score, best pipe and best parameters 
         best_score = -np.inf
         best_pipe = None
         best_params = None
-
+        
+        # employ generate_param_combinations method 
         param_combos = self.generate_param_combinations(
             {model_key: local_grid}
         )[model_key]
 
+        # iterate over every hyperparameter combination
         for combo in param_combos:
             proto = self.models[model_key]
             p = proto.get_params()
             p.update(combo)
             est = proto.__class__(**p)
+            # build a small pipeline: standardize → estimator
             pipeline = make_pipeline(StandardScaler(), est)
-
+            
+            # evaluate via cross‐validation using ROC AUC
             aucs = cross_val_score(
                 pipeline,
                 X_train,
@@ -178,31 +197,32 @@ class NestedCrossVal:
             )
             mean_auc = aucs.mean()
             print(f"[{model_key}] Tested {combo} -> AUC {mean_auc:.4f}")
-
+            
+            # update the “current best” if this combo results in greater mean auc score than the previous best score
             if mean_auc > best_score:
                 best_score, best_params = mean_auc, combo
                 best_pipe = pipeline
                 print(f"[{model_key}] New best AUC {mean_auc:.4f}, params {combo}")
 
-        # Return the (unfitted) pipeline and the best params dict:
+        # return the best (unfitted) pipeline and the best params dict:
         return best_pipe, best_params
 
-    def inner_loop(self, df, target, model_key, columns_to_remove=None, inner_cv=3):
-        """
-        Extract train data and run model_tuning.
-        """
-        X_tr, y_tr = self.separate_features_target(df, target, columns_to_remove)
-        return self.model_tuning(model_key, X_tr, y_tr, inner_cv)
-
     def outer_loop(self, df, target, model_key, outer_cv, inner_cv, columns_to_remove=None):
-   
-        # Determine which cols to drop
+        """
+        Run outer CV performasnce evaluation for one model.
+        Uses self.random_state and self.n_jobs internally.
+        """
+
+        # determine which cols to drop
         columns_to_remove = set(columns_to_remove or []) | {target}
         feature_cols = [c for c in df.columns if c not in columns_to_remove]
 
-        X_df = df[feature_cols]
-        y_sr = df[target]
+        X = df[feature_cols]
+        y = df[target]
 
+        # we used StratifiedKFold because we took into account that the dataset was slightly imbalanced and we want the folds
+        # we crate to reflect the whole dataset's class imbalance
+        # shuffle=True, shuffle before splitting
         outer_split = StratifiedKFold(
             n_splits=outer_cv,
             shuffle=True,
@@ -212,49 +232,49 @@ class NestedCrossVal:
         records = []
         best_params_list = []
 
-        for fold, (train_idx, test_idx) in enumerate(outer_split.split(X_df, y_sr), start=1):
-            # Build fold DataFrames/Series
-            X_tr = X_df.iloc[train_idx]
-            y_tr = y_sr.iloc[train_idx]
-            X_te = X_df.iloc[test_idx]
-            y_te = y_sr.iloc[test_idx]
+        for fold, (train_idx, test_idx) in enumerate(outer_split.split(X, y), start=1):
+            # build fold DataFrames/Series
+            X_train = X.iloc[train_idx]
+            y_train = y.iloc[train_idx]
+            X_test = X.iloc[test_idx]
+            y_test = y.iloc[test_idx]
 
-            # Inner tuning: get the best pipeline and its params
-            best_pipe, best_params = self.model_tuning(model_key, X_tr, y_tr, inner_cv)
+            # inner loop hyperparameter tuning: get the best pipeline and its params
+            best_pipe, best_params = self.model_tuning(model_key, X_train, y_train, inner_cv)
             best_params_list.append(best_params)
 
-            # Fit on the training fold
-            best_pipe.fit(X_tr, y_tr)
+            # fit on the training fold
+            best_pipe.fit(X_train, y_train)
 
-            # Predictions
-            y_pred = best_pipe.predict(X_te)
+            # predictions
+            y_pred = best_pipe.predict(X_test)
             if hasattr(best_pipe, "predict_proba"):
-                y_proba = best_pipe.predict_proba(X_te)[:, 1]
+                y_proba = best_pipe.predict_proba(X_test)[:, 1]
             else:
-                y_proba = best_pipe.decision_function(X_te)
+                y_proba = best_pipe.decision_function(X_test)
 
-            # Confusion-matrix stats
-            tn, fp, fn, tp = confusion_matrix(y_te, y_pred).ravel()
-            recall = recall_score(y_te, y_pred)
+            # confusion-matrix stats
+            tn, fp, fn, tp = confusion_matrix(y_test, y_pred).ravel()
+            recall = recall_score(y_test, y_pred)
             specificity = tn / (tn + fp) if (tn + fp) else np.nan
             npv = tn / (tn + fn) if (tn + fn) else np.nan
 
             # Precision–Recall AUC
-            prec_vals, rec_vals, _ = precision_recall_curve(y_te, y_proba)
+            prec_vals, rec_vals, _ = precision_recall_curve(y_test, y_proba)
             pr_auc = auc(rec_vals, prec_vals)
 
-            # Collect all metrics
+            # collect all metrics
             records.append({
                 'fold': fold,
-                'MCC': matthews_corrcoef(y_te, y_pred),
-                'AUC': roc_auc_score(y_te, y_proba),
+                'MCC': matthews_corrcoef(y_test, y_pred),
+                'AUC': roc_auc_score(y_test, y_proba),
                 'PRAUC': pr_auc,
-                'BA': balanced_accuracy_score(y_te, y_pred),
-                'F1': f1_score(y_te, y_pred),
-                'F2': fbeta_score(y_te, y_pred, beta=2),
+                'BA': balanced_accuracy_score(y_test, y_pred),
+                'F1': f1_score(y_test, y_pred),
+                'F2': fbeta_score(y_test, y_pred, beta=2),
                 'Recall': recall,
                 'Specificity': specificity,
-                'Precision': precision_score(y_te, y_pred),
+                'Precision': precision_score(y_test, y_pred),
                 'NPV': npv
             })
 
@@ -274,11 +294,11 @@ class NestedCrossVal:
         model_key : str
             Key identifying which model in self.models to run.
         outer_cv : int
-            Number of outer folds.
+            Number of outer fold loops.
         inner_cv : int
-            Number of inner folds.
+            Number of inner fold loops.
         num_rounds : int
-            Number of times to repeat the nested CV.
+            Number of rounds for the nCV.
         columns_to_remove : list, optional
             Columns to drop before CV.
 
@@ -289,8 +309,12 @@ class NestedCrossVal:
              'summary': DataFrame with median and 95% CI per metric,
              'best_params': list of param dicts per outer fold per round}
         """
+
+        # collect per-round results and parameters
         all_df = []
         all_params = []
+
+        # loop over the specified number of repeats
         for r in range(num_rounds):
             dfm, plist = self.outer_loop(
                 df, target, model_key,
@@ -298,12 +322,17 @@ class NestedCrossVal:
             )
             # bring fold index into column before concatenation
             dfm = dfm.reset_index()
+            # tag each row with the current repeat number (1-based)
             dfm['repeat'] = r + 1
+            # append this round’s metrics and extend the parameter list
             all_df.append(dfm)
             all_params.extend(plist)
+
         # concatenate all rounds retaining both 'fold' and 'repeat'
         full = pd.concat(all_df, ignore_index=True)
         metrics = full.drop(columns=['repeat','fold'])
+
+        # compute summary statistics
         summary = pd.DataFrame({
             'median': metrics.median(),
             'ci_lower': metrics.quantile(0.025),
