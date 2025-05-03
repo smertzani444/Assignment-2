@@ -156,7 +156,9 @@ class NestedCrossVal:
         Run inner CV hyperparameter search for one model.
         Uses self.random_state and self.n_jobs internally.
         """
-        # we used StratifiedKFold because we took into account that the dataset was slightly imbalanced
+        # we used StratifiedKFold because we took into account that the dataset was slightly imbalanced and we want the folds
+        # we crate to reflect the whole dataset's class imbalance
+        # shuffle=True, shuffle before splitting
         inner_split = StratifiedKFold(
             n_splits=inner_cv,
             shuffle=True,
@@ -164,22 +166,27 @@ class NestedCrossVal:
         )
         
         local_grid = self.param_grid[model_key]
-
+        
+        # initialize best score, best pipe and best parameters 
         best_score = -np.inf
         best_pipe = None
         best_params = None
-
+        
+        # employ generate_param_combinations method 
         param_combos = self.generate_param_combinations(
             {model_key: local_grid}
         )[model_key]
 
+        # iterate over every hyperparameter combination
         for combo in param_combos:
             proto = self.models[model_key]
             p = proto.get_params()
             p.update(combo)
             est = proto.__class__(**p)
+            # build a small pipeline: standardize → estimator
             pipeline = make_pipeline(StandardScaler(), est)
-
+            
+            # evaluate via cross‐validation using ROC AUC
             aucs = cross_val_score(
                 pipeline,
                 X_train,
@@ -190,24 +197,32 @@ class NestedCrossVal:
             )
             mean_auc = aucs.mean()
             print(f"[{model_key}] Tested {combo} -> AUC {mean_auc:.4f}")
-
+            
+            # update the “current best” if this combo results in greater mean auc score than the previous best score
             if mean_auc > best_score:
                 best_score, best_params = mean_auc, combo
                 best_pipe = pipeline
                 print(f"[{model_key}] New best AUC {mean_auc:.4f}, params {combo}")
 
-        # Return the (unfitted) pipeline and the best params dict:
+        # return the best (unfitted) pipeline and the best params dict:
         return best_pipe, best_params
 
     def outer_loop(self, df, target, model_key, outer_cv, inner_cv, columns_to_remove=None):
-   
-        # Determine which cols to drop
+        """
+        Run outer CV performasnce evaluation for one model.
+        Uses self.random_state and self.n_jobs internally.
+        """
+
+        # determine which cols to drop
         columns_to_remove = set(columns_to_remove or []) | {target}
         feature_cols = [c for c in df.columns if c not in columns_to_remove]
 
-        X_df = df[feature_cols]
-        y_sr = df[target]
+        X = df[feature_cols]
+        y = df[target]
 
+        # we used StratifiedKFold because we took into account that the dataset was slightly imbalanced and we want the folds
+        # we crate to reflect the whole dataset's class imbalance
+        # shuffle=True, shuffle before splitting
         outer_split = StratifiedKFold(
             n_splits=outer_cv,
             shuffle=True,
@@ -217,49 +232,49 @@ class NestedCrossVal:
         records = []
         best_params_list = []
 
-        for fold, (train_idx, test_idx) in enumerate(outer_split.split(X_df, y_sr), start=1):
-            # Build fold DataFrames/Series
-            X_tr = X_df.iloc[train_idx]
-            y_tr = y_sr.iloc[train_idx]
-            X_te = X_df.iloc[test_idx]
-            y_te = y_sr.iloc[test_idx]
+        for fold, (train_idx, test_idx) in enumerate(outer_split.split(X, y), start=1):
+            # build fold DataFrames/Series
+            X_train = X.iloc[train_idx]
+            y_train = y.iloc[train_idx]
+            X_test = X.iloc[test_idx]
+            y_test = y.iloc[test_idx]
 
-            # Inner tuning: get the best pipeline and its params
-            best_pipe, best_params = self.model_tuning(model_key, X_tr, y_tr, inner_cv)
+            # inner loop hyperparameter tuning: get the best pipeline and its params
+            best_pipe, best_params = self.model_tuning(model_key, X_train, y_train, inner_cv)
             best_params_list.append(best_params)
 
-            # Fit on the training fold
-            best_pipe.fit(X_tr, y_tr)
+            # fit on the training fold
+            best_pipe.fit(X_train, y_train)
 
-            # Predictions
-            y_pred = best_pipe.predict(X_te)
+            # predictions
+            y_pred = best_pipe.predict(X_test)
             if hasattr(best_pipe, "predict_proba"):
-                y_proba = best_pipe.predict_proba(X_te)[:, 1]
+                y_proba = best_pipe.predict_proba(X_test)[:, 1]
             else:
-                y_proba = best_pipe.decision_function(X_te)
+                y_proba = best_pipe.decision_function(X_test)
 
-            # Confusion-matrix stats
-            tn, fp, fn, tp = confusion_matrix(y_te, y_pred).ravel()
-            recall = recall_score(y_te, y_pred)
+            # confusion-matrix stats
+            tn, fp, fn, tp = confusion_matrix(y_test, y_pred).ravel()
+            recall = recall_score(y_test, y_pred)
             specificity = tn / (tn + fp) if (tn + fp) else np.nan
             npv = tn / (tn + fn) if (tn + fn) else np.nan
 
             # Precision–Recall AUC
-            prec_vals, rec_vals, _ = precision_recall_curve(y_te, y_proba)
+            prec_vals, rec_vals, _ = precision_recall_curve(y_test, y_proba)
             pr_auc = auc(rec_vals, prec_vals)
 
-            # Collect all metrics
+            # collect all metrics
             records.append({
                 'fold': fold,
-                'MCC': matthews_corrcoef(y_te, y_pred),
-                'AUC': roc_auc_score(y_te, y_proba),
+                'MCC': matthews_corrcoef(y_test, y_pred),
+                'AUC': roc_auc_score(y_test, y_proba),
                 'PRAUC': pr_auc,
-                'BA': balanced_accuracy_score(y_te, y_pred),
-                'F1': f1_score(y_te, y_pred),
-                'F2': fbeta_score(y_te, y_pred, beta=2),
+                'BA': balanced_accuracy_score(y_test, y_pred),
+                'F1': f1_score(y_test, y_pred),
+                'F2': fbeta_score(y_test, y_pred, beta=2),
                 'Recall': recall,
                 'Specificity': specificity,
-                'Precision': precision_score(y_te, y_pred),
+                'Precision': precision_score(y_test, y_pred),
                 'NPV': npv
             })
 
@@ -279,11 +294,11 @@ class NestedCrossVal:
         model_key : str
             Key identifying which model in self.models to run.
         outer_cv : int
-            Number of outer folds.
+            Number of outer fold loops.
         inner_cv : int
-            Number of inner folds.
+            Number of inner fold loops.
         num_rounds : int
-            Number of times to repeat the nested CV.
+            Number of rounds for the nCV.
         columns_to_remove : list, optional
             Columns to drop before CV.
 
@@ -294,8 +309,12 @@ class NestedCrossVal:
              'summary': DataFrame with median and 95% CI per metric,
              'best_params': list of param dicts per outer fold per round}
         """
+
+        # collect per-round results and parameters
         all_df = []
         all_params = []
+
+        # loop over the specified number of repeats
         for r in range(num_rounds):
             dfm, plist = self.outer_loop(
                 df, target, model_key,
@@ -303,12 +322,17 @@ class NestedCrossVal:
             )
             # bring fold index into column before concatenation
             dfm = dfm.reset_index()
+            # tag each row with the current repeat number (1-based)
             dfm['repeat'] = r + 1
+            # append this round’s metrics and extend the parameter list
             all_df.append(dfm)
             all_params.extend(plist)
+
         # concatenate all rounds retaining both 'fold' and 'repeat'
         full = pd.concat(all_df, ignore_index=True)
         metrics = full.drop(columns=['repeat','fold'])
+
+        # compute summary statistics
         summary = pd.DataFrame({
             'median': metrics.median(),
             'ci_lower': metrics.quantile(0.025),
@@ -331,16 +355,26 @@ class Classifier:
     ]
 
     def load_data(self, path):
+        """
+        Load data from the path were it was stored.
+        """
         if not os.path.isfile(path):
             raise FileNotFoundError(f"The file at {path} was not found.")
         return pd.read_csv(path)
 
     def preprocess_data(self, df, columns_to_drop=None):
+        """
+        Remove unecessary columns, 
+        encode categorical features,
+        handle missing values and filling with column-wise 'mean'.
+        """
         if columns_to_drop is None:
             columns_to_drop = []
-
+        # drop unecessary columns 
         df=df.drop(columns=[col for col in columns_to_drop if col in df.columns])
+        # select columns that correspond to numerical features and make list
         num_list=df.select_dtypes(include=[np.number]).columns.tolist()
+        # make list of all columns other than the columns that have numerical values -> categorical features list
         cat_list=df.select_dtypes(exclude=[np.number]).columns.tolist()
 
         for col in cat_list:
@@ -418,7 +452,10 @@ class Classifier:
         }
 
     
-    def train_tuned_model(self, model, X, y, cmap, save_path, scale=True):
+    def train_tuned_model(self, model, X, y, cmap, scale=True):
+        """
+        Train model instance with hyperparameters.
+        """
         # split
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.3, random_state=42
@@ -434,11 +471,12 @@ class Classifier:
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
 
+        # plot for actual vs predicted positives and negatives
         cm = confusion_matrix(y_test, y_pred)
         cm_matrix = pd.DataFrame(data=cm, columns=['Actual Positive:1', 'Actual Negative:0'], 
                                  index=['Predict Positive:1', 'Predict Negative:0'])
-
         sns.heatmap(cm_matrix, annot=True, fmt='d', cmap=cmap)
+
         # compute AUC
         auc = roc_auc_score(y_test, y_pred)
         print(f"Model: {model.__class__.__name__} AUC: {auc:.4f}")
@@ -446,6 +484,11 @@ class Classifier:
         return auc
     
     def train_final_model(self, model, X, y, save_path, scale=True):
+        """
+        Train model instance with hyperparameters.
+        Save best model instance in provided path.
+        """
+
         # optional global scaling
         if scale:
             scaler = StandardScaler()
@@ -461,28 +504,12 @@ class Classifier:
         joblib.dump(model, save_path)
         print(f"Final model trained on all data and saved to {save_path}")
 
-        return model
-
-    def summarize(self, scores):
-        mean = np.mean(scores)
-        std = np.std(scores, ddof=1)
-        ci95 = t.interval(0.95, len(scores) - 1, loc=mean, scale=std / np.sqrt(len(scores)))
-        return {
-            'mean': mean,
-            'median': np.median(scores),
-            '95% CI': ci95
-        }
-
-    
-    def align_evaluation_set(self, dev_df, val_df):
-        dev_columns = dev_df.columns
-        val_aligned = val_df.copy()
-        val_aligned = val_aligned.reindex(columns=dev_columns, fill_value=0)
-        print("Evaluation dataset was aligned to development feature set.")
-        return val_aligned
-    
+        return model    
 
     def evaluate_model(self, model, X, y, runs=30, test_size=0.2, scale=True, save_path=None):
+        """
+        Evaluate model instance. 
+        """
         metrics = {
             'auc':   [],
             'prauc': [],
