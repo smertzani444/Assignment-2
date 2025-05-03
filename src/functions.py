@@ -429,17 +429,15 @@ class Classifier:
     
         # fit
         model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
 
-        # get prediction scores
-        if hasattr(model, "predict_proba"):
-            # binary: take probability of class “1”
-            y_scores = model.predict_proba(X_test)[:, 1]
-        else:
-            # e.g. SVM with decision_function
-            y_scores = model.decision_function(X_test)
+        cm = confusion_matrix(y_test, y_pred)
+        cm_matrix = pd.DataFrame(data=cm, columns=['Actual Positive:1', 'Actual Negative:0'], 
+                                 index=['Predict Positive:1', 'Predict Negative:0'])
 
+        sns.heatmap(cm_matrix, annot=True, fmt='d', cmap='YlGnBu')
         # compute AUC
-        auc = roc_auc_score(y_test, y_scores)
+        auc = roc_auc_score(y_test, y_pred)
         print(f"Model: {model.__class__.__name__} AUC: {auc:.4f}")
 
         return auc
