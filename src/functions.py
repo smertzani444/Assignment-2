@@ -24,6 +24,12 @@ from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 import lightgbm as lgb
 
+# **Note that the methods designed for the previous assignment that were employed
+# in this assignment may have been slightly modifiedin order to fit in this assignment as well or slightly improved 
+# **Note that the methods designed for the previous assignment that were employed
+# in this assignment take as input the argument **model**, whereas the methods created for this assignment 
+# take as input the argument **model_key**, which is ultimately the same
+
 class NestedCrossVal:
     def __init__(
         self,
@@ -39,11 +45,11 @@ class NestedCrossVal:
         Parameters
         ----------
         R : int
-            Number of repetitions of the full nested CV.
+            Number of rounds for the nCV.
         N : int
-            Number of outer folds.
+            Number of outer fold loops.
         K : int
-            Number of inner folds.
+            Number of inner fold loops.
         random_state : int
             Seed for reproducibility.
         n_jobs : int
@@ -60,7 +66,8 @@ class NestedCrossVal:
             'RandomForest': RandomForestClassifier(random_state=random_state),
             'LightGBM': lgb.LGBMClassifier(random_state=random_state)
         }
-        # Default hyperparameter grids
+        
+        # Default hyperparameter spaces for each classifier that will be used for tuning
         self.param_grid = {
             'LogisticRegression-elasticnet': {
                 'C': [0.01, 0.1, 1, 10],
@@ -103,18 +110,35 @@ class NestedCrossVal:
         # detect “winner-model” usage
         if isinstance(param_grid, list):
             param_grid = {'__winner__': param_grid}
-
+        
+        # prepare the output dictionary 
+        # keys are model names, values are list of hyperparameters combination dicts
         model_combinations = {}
+
+        # iterate over each model name and its associated hyperparameters combinations 
+        # iterate over each (model, params) pair in the param_grid
         for model, params in param_grid.items():
+            # if params is a list of multiple grids,
+            # handle each grid separately
             if isinstance(params, list):
                 combos = []
+                # iterate through each parameter grid dictionary in the list
+                # pset = set of parameters 
                 for pset in params:
+                    # concept of itertools.product -> we used it on the unpacked lists of values to 
+                    # generate every combination and then zip back with keys to yield concrete parameter-setting dict
+                    # unzip the dict into parallel sequences of keys and lists-of-values
                     keys, vals = zip(*pset.items())
                     for v in itertools.product(*vals):
+                        # zip back into a dict mapping each key to one chosen value
                         combos.append(dict(zip(keys, v)))
                 model_combinations[model] = combos
+
+            # if params is a single dict, expand directly
             else:
+                # separate parameter names and their candidate values
                 keys, vals = zip(*params.items())
+                # build one config dict per combination of values
                 model_combinations[model] = [dict(zip(keys, v)) for v in itertools.product(*vals)]
         return model_combinations
 
@@ -132,27 +156,14 @@ class NestedCrossVal:
         Run inner CV hyperparameter search for one model.
         Uses self.random_state and self.n_jobs internally.
         """
+        # we used StratifiedKFold because we took into account that the dataset was slightly imbalanced
         inner_split = StratifiedKFold(
             n_splits=inner_cv,
             shuffle=True,
             random_state=self.random_state
         )
-
-        if model_key == 'LightGBM':
-            # compute imbalance ratio on this fold's training data
-            neg, pos = np.bincount(y_train)
-            ratio = neg / pos
-            # make a shallow copy of the param grid so we don't pollute self.param_grid permanently
-            local_grid = dict(self.param_grid['LightGBM'])
-            local_grid.update({
-                'scale_pos_weight': [ratio, 1.0],
-                'boosting_type':      ['gbdt', 'dart'],
-                'reg_alpha':          [0, 0.1, 1],
-                'reg_lambda':         [0, 0.1, 1],
-                # you can also experiment with more n_estimators here
-            })
-        else:
-            local_grid = self.param_grid[model_key]
+        
+        local_grid = self.param_grid[model_key]
 
         best_score = -np.inf
         best_pipe = None
@@ -187,14 +198,6 @@ class NestedCrossVal:
 
         # Return the (unfitted) pipeline and the best params dict:
         return best_pipe, best_params
-    
-    
-    def inner_loop(self, df, target, model_key, columns_to_remove=None, inner_cv=3):
-        """
-        Extract train data and run model_tuning.
-        """
-        X_tr, y_tr = self.separate_features_target(df, target, columns_to_remove)
-        return self.model_tuning(model_key, X_tr, y_tr, inner_cv)
 
     def outer_loop(self, df, target, model_key, outer_cv, inner_cv, columns_to_remove=None):
    
@@ -261,7 +264,7 @@ class NestedCrossVal:
             })
 
         metrics_df = pd.DataFrame(records).set_index('fold')
-        return metrics_df, best_params_list, y_te, y_pred
+        return metrics_df, best_params_list
 
     def run_repeated_nested_cv(self, df, target, model_key, outer_cv, inner_cv, num_rounds, columns_to_remove=None):
         """
@@ -294,7 +297,7 @@ class NestedCrossVal:
         all_df = []
         all_params = []
         for r in range(num_rounds):
-            dfm, plist, y_te, y_pred = self.outer_loop(
+            dfm, plist = self.outer_loop(
                 df, target, model_key,
                 outer_cv, inner_cv, columns_to_remove
             )
