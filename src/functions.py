@@ -415,7 +415,7 @@ class Classifier:
         }
 
     
-    def train_tuned_model(self, model, X, y, save_path, scale=True):
+    def train_tuned_model(self, model, X, y, cmap, save_path, scale=True):
         # split
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.3, random_state=42
@@ -435,7 +435,7 @@ class Classifier:
         cm_matrix = pd.DataFrame(data=cm, columns=['Actual Positive:1', 'Actual Negative:0'], 
                                  index=['Predict Positive:1', 'Predict Negative:0'])
 
-        sns.heatmap(cm_matrix, annot=True, fmt='d', cmap='YlGnBu')
+        sns.heatmap(cm_matrix, annot=True, fmt='d', cmap=cmap)
         # compute AUC
         auc = roc_auc_score(y_test, y_pred)
         print(f"Model: {model.__class__.__name__} AUC: {auc:.4f}")
